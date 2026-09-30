@@ -2,11 +2,11 @@
 # Email: mayank.24b0101760@gmail.com
 
 from fastapi import FastAPI, UploadFile, File
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 import shutil
 import os
 from services.ingestion import ingest_pdfs
-from domain.qa import answer_query
+from domain.qa import stream_query
 
 app = FastAPI(title="Academic Q&A System (P_102)")
 
@@ -25,7 +25,8 @@ async def upload_pdf(file: UploadFile = File(...)):
 
 @app.get("/query")
 async def query_system(q: str):
-    return answer_query(q)
+    # Returns the streaming generator directly to the client
+    return StreamingResponse(stream_query(q), media_type="application/x-ndjson")
 
 @app.get("/", response_class=HTMLResponse)
 async def get_ui():
@@ -105,7 +106,6 @@ async def get_ui():
         </style>
     </head>
     <body>
-        <!-- Sidebar -->
         <div class="sidebar">
             <div class="logo-area">
                 📚 <div>
@@ -123,7 +123,6 @@ async def get_ui():
             <div id="file-name-display" class="file-name-display"></div>
             <button class="btn-process" id="process-btn" onclick="uploadAndProcess()">Upload & Process</button>
             
-            <!-- New persistent uploaded files list -->
             <div id="uploaded-list" class="uploaded-list"></div>
 
             <div class="section-title">SYSTEM STATUS</div>
@@ -148,7 +147,6 @@ async def get_ui():
             </div>
         </div>
 
-        <!-- Main Chat Area -->
         <div class="main-content">
             <div class="chat-header">
                 <div>
@@ -198,15 +196,12 @@ async def get_ui():
 
                 try {
                     const response = await fetch('/upload', { method: 'POST', body: formData });
-                    const result = await response.json();
+                    await response.json();
                     
-                    // Add to the permanent list
                     uploadedList.innerHTML += `<div class="uploaded-item">📄 ${file.name}</div>`;
-                    
                     btn.innerText = "Processed Successfully!";
                     btn.style.backgroundColor = "#10b981";
                     
-                    // Reset upload area after 3 seconds
                     setTimeout(() => {
                         btn.innerText = "Upload & Process";
                         btn.style.backgroundColor = "";
@@ -221,37 +216,17 @@ async def get_ui():
                 }
             }
 
-            function addMessageToUI(role, content, sources = []) {
+            function addUserMessage(content) {
                 const chatHistory = document.getElementById('chat-history');
                 const wrapper = document.createElement('div');
-                wrapper.className = `message-wrapper ${role === 'user' ? 'user-msg' : 'ai-msg'}`;
-                
-                let avatarIcon = role === 'user' ? '👤' : '🤖';
-                let headerText = role === 'user' ? 'You' : 'Academic RAG';
-
-                let sourceHtml = '';
-                if (role === 'ai' && sources.length > 0) {
-                    let cardsHtml = sources.map(s => 
-                        `<div class="source-card"><strong>${s.file}</strong><br>Page ${s.page}</div>`
-                    ).join('');
-                    
-                    sourceHtml = `
-                        <details>
-                            <summary>▶ Retrieved Sources</summary>
-                            <div class="sources-content">${cardsHtml}</div>
-                        </details>
-                    `;
-                }
-
+                wrapper.className = 'message-wrapper user-msg';
                 wrapper.innerHTML = `
-                    <div class="avatar">${avatarIcon}</div>
+                    <div class="avatar">👤</div>
                     <div class="message-content">
-                        <div style="font-size: 12px; font-weight: 600; color: var(--text-muted); margin-bottom: 4px;">${headerText}</div>
-                        <div>${content.replace(/\\n/g, '<br>')}</div>
-                        ${sourceHtml}
+                        <div style="font-size: 12px; font-weight: 600; color: var(--text-muted); margin-bottom: 4px;">You</div>
+                        <div>${content}</div>
                     </div>
                 `;
-                
                 chatHistory.appendChild(wrapper);
                 chatHistory.scrollTop = chatHistory.scrollHeight;
             }
@@ -261,33 +236,79 @@ async def get_ui():
                 const question = inputField.value.trim();
                 if (!question) return;
 
-                addMessageToUI('user', question);
+                addUserMessage(question);
                 inputField.value = '';
 
                 const chatHistory = document.getElementById('chat-history');
-                const loadingId = 'loading-' + Date.now();
-                const loadingWrapper = document.createElement('div');
-                loadingWrapper.className = 'message-wrapper ai-msg';
-                loadingWrapper.id = loadingId;
-                loadingWrapper.innerHTML = `
+                const msgId = 'msg-' + Date.now();
+                
+                // Create empty AI message box
+                const aiWrapper = document.createElement('div');
+                aiWrapper.className = 'message-wrapper ai-msg';
+                aiWrapper.innerHTML = `
                     <div class="avatar">🤖</div>
                     <div class="message-content">
                         <div style="font-size: 12px; font-weight: 600; color: var(--text-muted); margin-bottom: 4px;">Academic RAG</div>
-                        <div style="color: var(--text-muted);">Thinking...</div>
+                        <div id="ans-${msgId}" style="color: var(--text-muted);">Thinking...</div>
+                        <div id="src-${msgId}" style="display: none;"></div>
                     </div>
                 `;
-                chatHistory.appendChild(loadingWrapper);
+                chatHistory.appendChild(aiWrapper);
                 chatHistory.scrollTop = chatHistory.scrollHeight;
 
                 try {
                     const response = await fetch(`/query?q=${encodeURIComponent(question)}`);
-                    const data = await response.json();
+                    const reader = response.body.getReader();
+                    const decoder = new TextDecoder("utf-8");
                     
-                    document.getElementById(loadingId).remove();
-                    addMessageToUI('ai', data.answer, data.sources);
+                    const ansDiv = document.getElementById(`ans-${msgId}`);
+                    const srcDiv = document.getElementById(`src-${msgId}`);
+                    
+                    ansDiv.innerHTML = ""; // Clear "Thinking..."
+                    ansDiv.style.color = "var(--text-main)";
+                    
+                    let buffer = "";
+
+                    // Read the stream chunk-by-chunk
+                    while (true) {
+                        const { done, value } = await reader.read();
+                        if (done) break;
+                        
+                        buffer += decoder.decode(value, { stream: true });
+                        const lines = buffer.split('\\n');
+                        buffer = lines.pop(); // Keep incomplete lines in the buffer
+                        
+                        for (const line of lines) {
+                            if (!line.trim()) continue;
+                            
+                            const data = JSON.parse(line);
+                            
+                            if (data.type === 'sources') {
+                                if (data.content.length > 0) {
+                                    let cardsHtml = data.content.map(s => 
+                                        `<div class="source-card"><strong>${s.file}</strong><br>Page ${s.page}</div>`
+                                    ).join('');
+                                    srcDiv.innerHTML = `
+                                        <details>
+                                            <summary>▶ Retrieved Sources</summary>
+                                            <div class="sources-content">${cardsHtml}</div>
+                                        </details>
+                                    `;
+                                    srcDiv.style.display = 'block';
+                                }
+                            } 
+                            else if (data.type === 'chunk') {
+                                // Append text dynamically as it generates
+                                ansDiv.innerHTML += data.content.replace(/\\n/g, '<br>');
+                                chatHistory.scrollTop = chatHistory.scrollHeight;
+                            } 
+                            else if (data.type === 'error') {
+                                ansDiv.innerHTML = `<span style="color: #ef4444;">${data.content}</span>`;
+                            }
+                        }
+                    }
                 } catch (error) {
-                    document.getElementById(loadingId).remove();
-                    addMessageToUI('ai', "Error connecting to the local AI backend.");
+                    document.getElementById(`ans-${msgId}`).innerHTML = `<span style="color: #ef4444;">Error connecting to backend.</span>`;
                 }
             }
         </script>
