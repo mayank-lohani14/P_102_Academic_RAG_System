@@ -6,3 +6,7 @@ langchain-community
 langchain-huggingface
 faiss-cpu
 python-multipart
+sqlalchemy
+psycopg2-binary
+requests
+sentence-transformers

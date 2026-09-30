@@ -1,0 +1,10 @@
+services:
+  rag_api:
+    build: .
+    container_name: p102_rag_app
+    ports:
+      - "8081:8000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      - OLLAMA_HOST=http://host.docker.internal:11434
