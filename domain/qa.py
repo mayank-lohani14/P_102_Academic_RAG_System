@@ -28,6 +28,24 @@ def check_grounding(context: str, generated_answer: str, model_name: str = "llam
     return "YES" in result
 
 def stream_query(user_query: str, file_filter: str = "all"):
+    # --- DATABASE CACHE CHECK ---
+    db = SessionLocal()
+    try:
+        cached_log = db.query(ChatLog).filter(
+            ChatLog.student_query == user_query,
+            ChatLog.target_document == file_filter
+        ).first()
+
+        if cached_log:
+            print("Cache hit! Returning saved response from PostgreSQL.")
+            yield json.dumps({"type": "chunk", "content": f"[Cached Answer] {cached_log.ai_response}"}) + "\n"
+            yield json.dumps({"type": "sources", "content": []}) + "\n"
+            return
+    except Exception as e:
+        print(f"Cache check error: {e}")
+    finally:
+        db.close()
+
     retriever = get_retriever(file_filter=file_filter)
     if not retriever:
         yield json.dumps({"type": "error", "content": "Database empty. Please upload PDFs first."}) + "\n"
